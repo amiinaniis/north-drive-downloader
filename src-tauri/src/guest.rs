@@ -261,7 +261,7 @@ async fn transfer_attempt(app:&AppHandle,client:&Client,file:&DownloadItem,part:
 }
 async fn download_one(app:&AppHandle,client:&Client,file:&DownloadItem,root:&Path,run:&RunControl)->Result<(),String>{
     let rel=safe_relative(&file.relative_path)?;
-    let target=root.join(rel);
+    let target=root.join(&rel);
     if let Some(parent)=target.parent(){async_fs::create_dir_all(parent).await.map_err(|e|e.to_string())?;}
     if target.exists(){return Err(format!("Destination already exists: {}. North Drive never overwrites it.",target.display()));}
     let (part,meta)=staged_paths(root,&rel);
