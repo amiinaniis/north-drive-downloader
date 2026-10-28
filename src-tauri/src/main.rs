@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod guest;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
 use reqwest::{header, Client, StatusCode};
@@ -392,70 +393,8 @@ fn workspace_export(mime: &str) -> Option<(&'static str, &'static str)> {
 }
 
 #[tauri::command]
-async fn scan_folder(link: String, state: State<'_, Arc<AppState>>) -> Result<FolderPlan, String> {
-    let prefs = state.prefs.lock().unwrap().clone();
-    let (id, rk) = parse_drive_link(&link)?;
-    let client = &state.client;
-    let (access, root) = resolve_access(client, &prefs, &id, &rk).await?;
-    if root.mime_type != FOLDER_MIME { return Err("The shared link is not a folder".into()); }
-    let mut queue: VecDeque<(String, String)> = VecDeque::from([(id.clone(), String::new())]);
-    let mut keys = HashMap::new();
-    if let Some(k) = rk.clone().or(root.resource_key.clone()) { keys.insert(id.clone(), k); }
-    let mut seen_folders: HashSet<String> = std::iter::once(id.clone()).collect();
-    let mut files = Vec::new(); let mut empty_folders = Vec::new(); let mut warnings = Vec::new();
-    let mut total_bytes = 0u64;
-    while let Some((folder_id, parent_path)) = queue.pop_front() {
-        let mut found_children = false;
-        let mut page: Option<String> = None;
-        let mut occupied = HashSet::new();
-        loop {
-            let mut params = vec![
-                ("q", format!("'{}' in parents and trashed = false", folder_id)),
-                ("pageSize", "1000".into()),
-                ("fields", "nextPageToken,files(id,name,mimeType,size,md5Checksum,resourceKey,capabilities(canDownload))".into()),
-                ("supportsAllDrives", "true".into()),
-                ("includeItemsFromAllDrives", "true".into()),
-            ];
-            if let Some(ref token) = page { params.push(("pageToken", token.clone())); }
-            let mut request_keys = HashMap::new();
-            if let Some(k) = keys.get(&id) { request_keys.insert(id.clone(), k.clone()); }
-            if let Some(k) = keys.get(&folder_id) { request_keys.insert(folder_id.clone(), k.clone()); }
-            let result: FilePage = json_request(client, &access, DRIVE_BASE, &params, &request_keys).await?;
-            for entry in result.files {
-                found_children = true;
-                if let Some(k) = &entry.resource_key { keys.insert(entry.id.clone(), k.clone()); }
-                let export = workspace_export(&entry.mime_type);
-                let base_name = sanitized_name(&entry.name);
-                let filename = if let Some((_,suffix)) = export { format!("{base_name}{suffix}") } else { base_name };
-                let final_name = unique_name(&filename, &mut occupied);
-                let relative_path = if parent_path.is_empty() { final_name.clone() } else { format!("{parent_path}/{final_name}") };
-                if entry.mime_type == FOLDER_MIME {
-                    if seen_folders.insert(entry.id.clone()) { queue.push_back((entry.id, relative_path)); }
-                    continue;
-                }
-                if entry.mime_type == SHORTCUT_MIME {
-                    warnings.push(format!("Shortcut not copied: {relative_path}"));
-                    continue;
-                }
-                if entry.capabilities.as_ref().and_then(|x| x.can_download) == Some(false) {
-                    warnings.push(format!("Download disabled by owner: {relative_path}"));
-                    continue;
-                }
-                if entry.mime_type.starts_with("application/vnd.google-apps.") && export.is_none() {
-                    warnings.push(format!("Unsupported Google Workspace file: {relative_path}"));
-                    continue;
-                }
-                let file_path = relative_path;
-                let size = entry.size.and_then(|v| v.parse::<u64>().ok());
-                total_bytes = total_bytes.saturating_add(size.unwrap_or_default());
-                files.push(DownloadItem { id: entry.id, name: final_name, relative_path: file_path, size, mime_type: entry.mime_type, md5_checksum: entry.md5_checksum, resource_key: entry.resource_key, export_mime: export.map(|(m,_)| m.into()) });
-            }
-            page = result.next_page_token;
-            if page.is_none() { break; }
-        }
-        if !found_children && !parent_path.is_empty() { empty_folders.push(parent_path); }
-    }
-    Ok(FolderPlan { folder_id: id, folder_name: sanitized_name(&root.name), files, empty_folders, total_bytes, warnings, access_method: access.method().into(), folder_resource_key: rk.or(root.resource_key) })
+async fn scan_folder(link: String) -> Result<FolderPlan, String> {
+    guest::scan_folder(&link).await
 }
 
 fn safe_relative(raw: &str) -> Result<PathBuf, String> {
@@ -615,7 +554,7 @@ async fn start_download(app: AppHandle, state: State<'_, Arc<AppState>>, plan: F
     let client = state.client.clone(); let app_handle = app.clone();
     let state_handle = state.inner().clone();
     tauri::async_runtime::spawn(async move {
-        let result = download_folder(&app_handle, &client, &prefs, &plan, &destination, &run).await;
+        let result = guest::download_folder(&app_handle, &plan, &destination, &run).await;
         let _ = app_handle.emit("north:summary", result);
         let mut active = state_handle.run.lock().unwrap();
         if active.as_ref().is_some_and(|existing| Arc::ptr_eq(existing, &run)) { *active = None; }

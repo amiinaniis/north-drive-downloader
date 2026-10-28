@@ -86,3 +86,8 @@ img,svg{-webkit-user-drag:none}
 .connection-issue{margin-top:14px;padding:14px 16px;border-radius:12px;border:1px solid #854d54;background:#411d264a;color:#ffc9d1;line-height:1.7;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
 .connection-issue[hidden]{display:none}
 #diagnoseBtn{margin-top:13px}
+
+/* Public guest edition: remove sign-in affordances while retaining compact navigation. */
+.nav-item[data-page="accounts"],#page-accounts,#topAccountBtn,#sidebarAccountBtn{display:none!important}
+.account-selector{cursor:default}
+.connection-pill .status-dot{background:#4dd19c}
