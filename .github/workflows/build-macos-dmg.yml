@@ -15,7 +15,7 @@ jobs:
     env:
       CI: 'true'
       APPLE_SIGNING_IDENTITY: '-'
-      NORTH_GOOGLE_CLIENT_ID: ${{ vars.NORTH_GOOGLE_CLIENT_ID }}
+      NORTH_GOOGLE_CLIENT_ID: '697235040185-knej2j5jpjduef9uanv3g1n7k6aeq2ph.apps.googleusercontent.com'
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
