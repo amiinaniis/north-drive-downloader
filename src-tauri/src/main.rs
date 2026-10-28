@@ -228,7 +228,7 @@ async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<GoogleProfile
         }
     }).await.map_err(|_| "Google sign-in timed out".to_string())??;
     let response = state.client.post("https://oauth2.googleapis.com/token").form(&[
-        ("code", code.as_str()), ("client_id", client_id.as_str()), ("code_verifier", verifier.as_str()),
+        ("code", code.as_str()), ("client_id", client_id), ("code_verifier", verifier.as_str()),
         ("redirect_uri", redirect_uri.as_str()), ("grant_type", "authorization_code")
     ]).send().await.map_err(|e| e.to_string())?;
     if !response.status().is_success() { return Err(format!("Google sign-in failed: {}", response.text().await.unwrap_or_default())); }
@@ -244,7 +244,7 @@ async fn refresh_access_token(client: &Client, _prefs: &Preferences) -> Result<S
     if client_id.is_empty() { return Err("Google sign-in is not configured in this build. Contact the publisher".into()); }
     let refresh = keychain_entry()?.get_password().map_err(|_| "Google account not connected. Go to Accounts and sign in".to_string())?;
     let response = client.post("https://oauth2.googleapis.com/token").form(&[
-        ("client_id", client_id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
+        ("client_id", client_id), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
     ]).send().await.map_err(|e| e.to_string())?;
     if !response.status().is_success() { return Err("Google session expired or was revoked. Reconnect your account".into()); }
     let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
