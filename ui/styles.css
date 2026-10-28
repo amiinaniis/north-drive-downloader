@@ -63,3 +63,21 @@ img,svg{-webkit-user-drag:none}
  .connection-pill{max-width:150px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 }
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}}
+
+/* Signed-in Google identity: profile images are optional and never user IDs. */
+.account-profile-button{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;text-align:left;width:100%;border-radius:12px;min-width:0;padding:7px 9px}
+.account-profile-button:hover{background:#ffffff0a}
+.account-name-block{min-width:0;flex:1}
+.account-name-block strong,.account-name-block small{max-width:145px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.avatar,.account-avatar-small,.google-large,.user-avatar{overflow:hidden;flex-shrink:0}
+.avatar img,.account-avatar-small img,.google-large img,.user-avatar img{display:block;width:100%;height:100%;object-fit:cover;border-radius:inherit}
+.account-avatar-small{height:26px;width:26px;border-radius:50%;display:grid;place-items:center;background:#35203e;color:#ff9aca;font-weight:700;font-size:11px}
+.account-avatar-button{appearance:none;cursor:pointer;padding:0}
+.account-avatar-button:hover{outline:1px solid #fa65b6}
+.google-large.account-profile-large{border-radius:50%;font-size:23px}
+.account-identity{min-width:0}
+.account-identity h3,.account-identity p{max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tiny-dot{background:#6c6270}
+.tiny-dot.connected{background:#3bcfa0;box-shadow:0 0 9px #2cbf8b55}
+@media(max-width:980px){.account-profile-button{width:48px;min-height:48px;padding:5px}.account-profile-button .account-name-block,.account-profile-button .tiny-dot{display:none}.sidebar .sidebar-bottom.account-profile-button{display:flex}.sidebar-bottom .avatar{height:36px;width:36px}}
+@media(max-width:760px){.account-info{flex-wrap:wrap}.account-info .space{display:none}.account-info #connectBtn,.account-info #disconnectBtn{margin-left:auto}}

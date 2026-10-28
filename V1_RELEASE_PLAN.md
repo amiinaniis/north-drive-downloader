@@ -35,3 +35,13 @@ Working baseline: v0.1.2 DMG packaged on GitHub Actions. V1.0-development curren
 **M4 Commercial QA:** signing/notarization, billing/license, licensing terms, support, accessibility and production release candidates.
 
 **Release rule:** The version number 1.0 is reserved for when every Must-pass gate above is verified on actual Macs.
+
+## M2 scope change — frictionless buyer sign-in
+
+- [x] Removed buyer-facing API key and OAuth client ID configuration fields.
+- [x] Switched folder scanning and download plans to authorized user OAuth access; no public API key required for signed-in users.
+- [x] Added OpenID Connect `openid email profile` scopes and Google UserInfo profile retrieval.
+- [x] Wired name, email, and optional profile photo into sidebar, topbar, account selector, and account detail UI.
+- [ ] **Publisher action:** create and verify Google OAuth Desktop application, then configure `NORTH_GOOGLE_CLIENT_ID` as a GitHub repository variable. Without this, sign-in is intentionally unavailable in the beta; the client ID is *not* a user-facing setting.
+- [ ] Test public-link resource keys and private client folders under the signed-in identity on a real Mac; Google restricted-scope verification still required for selling.
+- [ ] Account persistence, token expiry, and offline profile fallback QA.

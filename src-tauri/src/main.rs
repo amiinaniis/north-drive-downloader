@@ -12,27 +12,33 @@ use tokio::{fs as async_fs, io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener,
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 const DRIVE_BASE: &str = "https://www.googleapis.com/drive/v3/files";
-const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
+const SCOPE: &str = "openid email profile https://www.googleapis.com/auth/drive.readonly";
+const GOOGLE_USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const KEYCHAIN_SERVICE: &str = "com.northdrive.downloader.oauth";
 // The publisher's Desktop OAuth client ID is public by design; never embed a client secret.
 const BUNDLED_GOOGLE_CLIENT_ID: Option<&str> = option_env!("NORTH_GOOGLE_CLIENT_ID");
-fn oauth_client_id(prefs: &Preferences) -> String {
-    BUNDLED_GOOGLE_CLIENT_ID.filter(|s| !s.trim().is_empty())
-        .unwrap_or(prefs.client_id.as_str()).trim().to_owned()
+fn oauth_client_id() -> &'static str {
+    BUNDLED_GOOGLE_CLIENT_ID.filter(|s| !s.trim().is_empty()).unwrap_or("")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Preferences {
-    api_key: String,
-    client_id: String,
     save_directory: String,
     max_parallel: usize,
 }
 impl Default for Preferences {
     fn default() -> Self {
-        Self { api_key: String::new(), client_id: String::new(), save_directory: String::new(), max_parallel: 4 }
+        Self { save_directory: String::new(), max_parallel: 4 }
     }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoogleProfile {
+    // Google sub is immutable for this account + app. Never use name/picture as an identity key.
+    sub: String,
+    name: Option<String>,
+    email: Option<String>,
+    picture: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,7 +167,7 @@ fn get_auth_config() -> serde_json::Value {
 #[tauri::command]
 fn set_preferences(app: AppHandle, state: State<'_, Arc<AppState>>, preferences: Preferences) -> Result<(), String> {
     if preferences.max_parallel == 0 || preferences.max_parallel > 8 { return Err("Parallel downloads must be between 1 and 8".into()); }
-    let preferences = Preferences { api_key: preferences.api_key.trim().to_string(), client_id: preferences.client_id.trim().to_string(), save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
+    let preferences = Preferences { save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
     persist_prefs(&app, &preferences)?;
     *state.prefs.lock().unwrap() = preferences;
     Ok(())
@@ -180,9 +186,9 @@ fn new_verifier() -> (String, String, String) {
 }
 
 #[tauri::command]
-async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let client_id = oauth_client_id(&state.prefs.lock().unwrap());
-    if client_id.is_empty() { return Err("Add your Google OAuth Desktop Client ID in Settings first".into()); }
+async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<GoogleProfile, String> {
+    let client_id = oauth_client_id();
+    if client_id.is_empty() { return Err("Google sign-in is not configured for this build. Contact the North Drive publisher.".into()); }
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
@@ -228,13 +234,14 @@ async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, Strin
     if !response.status().is_success() { return Err(format!("Google sign-in failed: {}", response.text().await.unwrap_or_default())); }
     let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
     let refresh = token.refresh_token.ok_or("Google did not return a refresh token; revoke access and retry")?;
+    let profile = fetch_google_profile(&state.client, &token.access_token).await?;
     keychain_entry()?.set_password(&refresh).map_err(|e| e.to_string())?;
-    Ok("Google account connected".into())
+    Ok(profile)
 }
 
-async fn refresh_access_token(client: &Client, prefs: &Preferences) -> Result<String, String> {
-    let client_id = oauth_client_id(prefs);
-    if client_id.is_empty() { return Err("Publisher Google sign-in is not configured yet. Use a test OAuth Desktop Client ID in Settings".into()); }
+async fn refresh_access_token(client: &Client, _prefs: &Preferences) -> Result<String, String> {
+    let client_id = oauth_client_id();
+    if client_id.is_empty() { return Err("Google sign-in is not configured in this build. Contact the publisher".into()); }
     let refresh = keychain_entry()?.get_password().map_err(|_| "Google account not connected. Go to Accounts and sign in".to_string())?;
     let response = client.post("https://oauth2.googleapis.com/token").form(&[
         ("client_id", client_id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
@@ -242,6 +249,25 @@ async fn refresh_access_token(client: &Client, prefs: &Preferences) -> Result<St
     if !response.status().is_success() { return Err("Google session expired or was revoked. Reconnect your account".into()); }
     let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
     Ok(token.access_token)
+}
+
+async fn fetch_google_profile(client: &Client, access_token: &str) -> Result<GoogleProfile, String> {
+    let response = client.get(GOOGLE_USERINFO_URL)
+        .bearer_auth(access_token)
+        .send().await.map_err(|e| format!("Could not load Google profile: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Google profile request failed (HTTP {}). Please reconnect.", response.status()));
+    }
+    let profile: GoogleProfile = response.json().await.map_err(|e| format!("Invalid Google profile: {e}"))?;
+    if profile.sub.trim().is_empty() { return Err("Google did not provide a valid account identifier".into()); }
+    Ok(profile)
+}
+
+#[tauri::command]
+async fn get_google_profile(state: State<'_, Arc<AppState>>) -> Result<GoogleProfile, String> {
+    let prefs = state.prefs.lock().unwrap().clone();
+    let token = refresh_access_token(&state.client, &prefs).await?;
+    fetch_google_profile(&state.client, &token).await
 }
 
 fn parse_drive_link(link: &str) -> Result<(String, Option<String>), String> {
@@ -297,22 +323,13 @@ async fn metadata(client: &Client, access: &Access, id: &str, keys: &HashMap<Str
     ], keys).await
 }
 async fn resolve_access(client: &Client, prefs: &Preferences, id: &str, rk: &Option<String>) -> Result<(Access, DriveFile), String> {
-    let mut keys = HashMap::new(); if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
-    let mut public_err = String::new();
-    if !prefs.api_key.is_empty() {
-        let public = Access::Public(prefs.api_key.clone());
-        match metadata(client, &public, id, &keys).await {
-            Ok(meta) => return Ok((public,meta)), Err(err) => public_err = err
-        }
-    }
-    if has_login() {
-        let oauth = Access::OAuth(refresh_access_token(client, prefs).await?);
-        let meta = metadata(client, &oauth, id, &keys).await?;
-        return Ok((oauth, meta));
-    }
-    Err(if prefs.api_key.is_empty() {
-        "Configure a Google Drive API key for public links, or connect your Google account for restricted links".into()
-    } else { format!("Public access failed: {public_err}. If this is restricted, connect an authorized Google account") })
+    if !has_login() { return Err("Connect your Google account first to open Drive folder links".into()); }
+    let mut keys = HashMap::new();
+    if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
+    let oauth = Access::OAuth(refresh_access_token(client, prefs).await?);
+    let meta = metadata(client, &oauth, id, &keys).await
+        .map_err(|e| format!("Unable to access this folder with your connected Google account: {e}"))?;
+    Ok((oauth, meta))
 }
 fn workspace_export(mime: &str) -> Option<(&'static str, &'static str)> {
     match mime {
@@ -565,8 +582,10 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
             Err(e) => errors.push(e)
         }
     }
-    let access = if plan.access_method == "public" && !prefs.api_key.is_empty() { Access::Public(prefs.api_key.clone()) }
-        else { match refresh_access_token(client, prefs).await { Ok(t) => Access::OAuth(t), Err(e) => return RunSummary{completed:0,failed:plan.files.len(),cancelled:false,errors:vec![e]} } };
+    let access = match refresh_access_token(client, prefs).await {
+        Ok(token) => Access::OAuth(token),
+        Err(e) => return RunSummary { completed:0, failed:plan.files.len(), cancelled:false, errors:vec![e] }
+    };
     let auth_cache: AuthCache = Arc::new(tokio::sync::Mutex::new((Instant::now(), access)));
     let mut tasks = tokio::task::JoinSet::new();
     let mut completed = 0; let mut failed = 0;
@@ -618,7 +637,7 @@ fn main() {
             app.manage(Arc::new(AppState { prefs: Mutex::new(prefs), run: Mutex::new(None), client }));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, get_auth_config, connect_google, disconnect, scan_folder, start_download, pause_download, cancel_download])
+        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, get_auth_config, connect_google, get_google_profile, disconnect, scan_folder, start_download, pause_download, cancel_download])
         .run(tauri::generate_context!())
         .expect("Failed to start North Drive Downloader");
 }
