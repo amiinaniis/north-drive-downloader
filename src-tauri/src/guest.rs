@@ -112,6 +112,31 @@ pub(super) async fn scan_folder(link:&str)->Result<FolderPlan,String>{
         warnings:vec!["Public guest mode cannot inspect file sizes or calculate Google-provided checksums. Completed downloads are not cryptographically verified.".into()],
         access_method:"guest".into(),folder_resource_key:key})
 }
+fn staged_paths(root:&Path,rel:&Path)->(PathBuf,PathBuf){
+    // Staging inside a hidden folder keeps Finder free of unplayable temporary MP4s.
+    // The finalized file is moved into the visible folder after successful transfer.
+    part_paths(&root.join(".northdrive-partials").join(rel))
+}
+async fn migrate_legacy_parts(target:&Path,part:&Path,meta:&Path)->Result<(),String>{
+    if part.exists(){return Ok(());}
+    let (old_part,old_meta)=part_paths(target);
+    if !old_part.exists(){return Ok(());}
+    if let Some(parent)=part.parent(){async_fs::create_dir_all(parent).await.map_err(|e|e.to_string())?;}
+    if old_meta.exists() && !meta.exists(){
+        async_fs::rename(&old_meta,meta).await.map_err(|e|format!("Could not move old resume metadata: {e}"))?;
+    }
+    if !meta.exists(){
+        return Err(format!("Earlier temporary download has no resume metadata: {}. Keep it as-is, or move it out before starting over.",old_part.display()));
+    }
+    async_fs::rename(&old_part,part).await.map_err(|e|format!("Could not move earlier partial download: {e}"))?;
+    Ok(())
+}
+fn looks_like_error_page(bytes:&[u8])->bool{
+    let head=String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+    let s=head.trim_start_matches(|c:char|c.is_whitespace() || c=='\u{feff}').to_ascii_lowercase();
+    s.starts_with("<!doctype html") || s.starts_with("<html") || s.starts_with("<?xml")
+        || s.starts_with("{\"error\"") || s.starts_with("{\"code\"")
+}
 fn file_url(f:&DownloadItem)->Result<Url,String>{
     let id=&f.id;
     let raw=match f.mime_type.as_str(){
@@ -176,6 +201,12 @@ async fn transfer_attempt(app:&AppHandle,client:&Client,file:&DownloadItem,part:
         if !resp.status().is_success(){return Err(format!("Google download failed: HTTP {}",resp.status()));}
         let content_type=resp.headers().get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
         if !content_type.contains("text/html"){
+            let media_name=file.name.to_ascii_lowercase();
+            let media=media_name.ends_with(".mp4") || media_name.ends_with(".mov") || media_name.ends_with(".mxf")
+                || media_name.ends_with(".mkv") || media_name.ends_with(".avi");
+            if media && (content_type.starts_with("text/") || content_type.contains("json") || content_type.contains("xml")){
+                return Err(format!("Google returned {} rather than video data. Check sharing permissions or download limits.",content_type));
+            }
             if offset>0 {
                 if resp.status()!=StatusCode::PARTIAL_CONTENT{return Err("Google refused to resume partial file. Remove its .northpart files to restart.".into());}
                 let header_range=resp.headers().get(header::CONTENT_RANGE).and_then(|v|v.to_str().ok()).unwrap_or("");
@@ -193,11 +224,23 @@ async fn transfer_attempt(app:&AppHandle,client:&Client,file:&DownloadItem,part:
         url=next_confirm(&html,&base)?;
     }
     let mut response=download.ok_or("Google did not return a downloadable file")?;
+    let expected_segment=response.content_length();
     let mut output=async_fs::OpenOptions::new().create(true).append(true).open(part).await.map_err(|e|e.to_string())?;
     let mut bytes=offset;let start=Instant::now();let mut last=Instant::now();
+    let mut first_chunk=offset==0;
     progress(app,file,bytes,"downloading",0.0,None);
-    while let Some(chunk)=response.chunk().await.map_err(|e|e.to_string())?{
+    loop{
         wait_for_run(run).await?;
+        let next=tokio::time::timeout(Duration::from_secs(90),response.chunk()).await
+            .map_err(|_|"Transfer stalled for 90 seconds. It will retry and resume where possible.".to_string())?
+            .map_err(|e|e.to_string())?;
+        let Some(chunk)=next else{break};
+        if first_chunk{
+            first_chunk=false;
+            if looks_like_error_page(&chunk){
+                return Err("Google returned an HTML or JSON error page instead of a downloadable file.".into());
+            }
+        }
         output.write_all(&chunk).await.map_err(|e|e.to_string())?;
         bytes+=chunk.len() as u64;
         if last.elapsed()>Duration::from_millis(350){
@@ -208,6 +251,12 @@ async fn transfer_attempt(app:&AppHandle,client:&Client,file:&DownloadItem,part:
     }
     output.flush().await.map_err(|e|e.to_string())?;
     if bytes==0{return Err("Google returned an empty file".into());}
+    if let Some(expected)=expected_segment{
+        let received=bytes-offset;
+        if received!=expected{
+            return Err(format!("Incomplete Google response: received {received} of {expected} bytes. Retrying remaining bytes."));
+        }
+    }
     Ok(())
 }
 async fn download_one(app:&AppHandle,client:&Client,file:&DownloadItem,root:&Path,run:&RunControl)->Result<(),String>{
@@ -215,7 +264,9 @@ async fn download_one(app:&AppHandle,client:&Client,file:&DownloadItem,root:&Pat
     let target=root.join(rel);
     if let Some(parent)=target.parent(){async_fs::create_dir_all(parent).await.map_err(|e|e.to_string())?;}
     if target.exists(){return Err(format!("Destination already exists: {}. North Drive never overwrites it.",target.display()));}
-    let (part,meta)=part_paths(&target);
+    let (part,meta)=staged_paths(root,&rel);
+    if let Some(parent)=part.parent(){async_fs::create_dir_all(parent).await.map_err(|e|e.to_string())?;}
+    migrate_legacy_parts(&target,&part,&meta).await?;
     let marker=serde_json::to_vec(&serde_json::json!({"id":file.id,"mime":file.mime_type})).map_err(|e|e.to_string())?;
     if part.exists() && fs::read(&meta).ok().as_deref()!=Some(marker.as_slice()){
         return Err("A partial download has different source metadata. Remove .northpart files to retry.".into());
@@ -263,7 +314,13 @@ pub(super) async fn download_folder(app:&AppHandle,plan:&FolderPlan,destination:
         let app=app.clone();let client=client.clone();let root=root.clone();let run=run.clone();
         tasks.spawn(async move{
             let result=download_one(&app,&client,&file,&root,&run).await;
-            if let Err(ref e)=result{progress(&app,&file,fs::metadata(part_paths(&root.join(&file.relative_path)).0).map(|m|m.len()).unwrap_or(0),"failed",0.0,Some(e.clone()));}
+            if let Err(ref e)=result{
+                let downloaded=safe_relative(&file.relative_path).ok()
+                    .map(|rel|staged_paths(&root,&rel).0)
+                    .and_then(|path|fs::metadata(path).ok())
+                    .map(|m|m.len()).unwrap_or(0);
+                progress(&app,&file,downloaded,"failed",0.0,Some(e.clone()));
+            }
             result.map_err(|e|format!("{}: {e}",file.relative_path))
         });
     }
@@ -281,6 +338,18 @@ mod tests {
         <a href="https://drive.google.com/drive/folders/1abcdefghijklmnopqrstuvwxyz124">Footage</a></body></html>"#;
         let (name,items)=parse_page(html).unwrap();
         assert_eq!(name,"Client Assets");assert_eq!(items.len(),2);assert!(items[1].folder);
+    }
+    #[test]fn sniff_fake_video_pages(){
+        assert!(looks_like_error_page(b"<!DOCTYPE html><html>Drive quota exceeded</html>"));
+        assert!(looks_like_error_page(b" {\"error\":\"notFound\"}"));
+        assert!(!looks_like_error_page(b"\0\0\0\x18ftypisom\0\0\0\0"));
+    }
+    #[test]fn temporary_files_are_hidden(){
+        let root=Path::new("/tmp/Client Assets");
+        let rel=Path::new("CLIPS/C1456.MP4");
+        let (part,meta)=staged_paths(root,rel);
+        assert!(part.to_string_lossy().contains(".northdrive-partials/CLIPS/C1456.MP4.northpart"));
+        assert!(meta.to_string_lossy().ends_with(".northpart.json"));
     }
     #[test]fn block_untrusted_hosts(){
         let u=Url::parse("https://attacker.example/drive/folders/1abcdefghijklmnopqrstuvwxyz123").unwrap();
