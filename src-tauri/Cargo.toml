@@ -1,6 +1,6 @@
 [package]
 name = "north-drive-downloader"
-version = "0.1.2"
+version = "0.2.0-beta.1"
 description = "Direct Google Drive folder downloader for macOS"
 authors = ["North Drive"]
 edition = "2021"

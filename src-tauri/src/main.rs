@@ -14,6 +14,12 @@ const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 const DRIVE_BASE: &str = "https://www.googleapis.com/drive/v3/files";
 const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 const KEYCHAIN_SERVICE: &str = "com.northdrive.downloader.oauth";
+// The publisher's Desktop OAuth client ID is public by design; never embed a client secret.
+const BUNDLED_GOOGLE_CLIENT_ID: Option<&str> = option_env!("NORTH_GOOGLE_CLIENT_ID");
+fn oauth_client_id(prefs: &Preferences) -> String {
+    BUNDLED_GOOGLE_CLIENT_ID.filter(|s| !s.trim().is_empty())
+        .unwrap_or(prefs.client_id.as_str()).trim().to_owned()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -147,6 +153,12 @@ fn get_preferences(state: State<'_, Arc<AppState>>) -> Preferences { state.prefs
 #[tauri::command]
 fn is_connected() -> bool { has_login() }
 #[tauri::command]
+fn get_auth_config() -> serde_json::Value {
+    serde_json::json!({
+        "managedOAuthConfigured": BUNDLED_GOOGLE_CLIENT_ID.is_some_and(|id| !id.trim().is_empty())
+    })
+}
+#[tauri::command]
 fn set_preferences(app: AppHandle, state: State<'_, Arc<AppState>>, preferences: Preferences) -> Result<(), String> {
     if preferences.max_parallel == 0 || preferences.max_parallel > 8 { return Err("Parallel downloads must be between 1 and 8".into()); }
     let preferences = Preferences { api_key: preferences.api_key.trim().to_string(), client_id: preferences.client_id.trim().to_string(), save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
@@ -169,7 +181,7 @@ fn new_verifier() -> (String, String, String) {
 
 #[tauri::command]
 async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let client_id = state.prefs.lock().unwrap().client_id.clone();
+    let client_id = oauth_client_id(&state.prefs.lock().unwrap());
     if client_id.is_empty() { return Err("Add your Google OAuth Desktop Client ID in Settings first".into()); }
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -221,10 +233,11 @@ async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, Strin
 }
 
 async fn refresh_access_token(client: &Client, prefs: &Preferences) -> Result<String, String> {
-    if prefs.client_id.is_empty() { return Err("OAuth Client ID not configured".into()); }
+    let client_id = oauth_client_id(prefs);
+    if client_id.is_empty() { return Err("Publisher Google sign-in is not configured yet. Use a test OAuth Desktop Client ID in Settings".into()); }
     let refresh = keychain_entry()?.get_password().map_err(|_| "Google account not connected. Go to Accounts and sign in".to_string())?;
     let response = client.post("https://oauth2.googleapis.com/token").form(&[
-        ("client_id", prefs.client_id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
+        ("client_id", client_id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
     ]).send().await.map_err(|e| e.to_string())?;
     if !response.status().is_success() { return Err("Google session expired or was revoked. Reconnect your account".into()); }
     let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
@@ -605,7 +618,7 @@ fn main() {
             app.manage(Arc::new(AppState { prefs: Mutex::new(prefs), run: Mutex::new(None), client }));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, connect_google, disconnect, scan_folder, start_download, pause_download, cancel_download])
+        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, get_auth_config, connect_google, disconnect, scan_folder, start_download, pause_download, cancel_download])
         .run(tauri::generate_context!())
         .expect("Failed to start North Drive Downloader");
 }
