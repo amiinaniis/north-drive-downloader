@@ -1,0 +1,42 @@
+name: Build macOS Universal DMG
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dmg:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+      APPLE_SIGNING_IDENTITY: '-'
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Setup Rust universal targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install app dependencies
+        run: npm install --no-audit --no-fund
+      - name: Generate macOS app icons
+        run: npx tauri icon assets/icon.svg
+      - name: Validate frontend syntax
+        run: node --check ui/app.js
+      - name: Build and verify drag-and-drop DMG
+        run: zsh scripts/build-dmg.command
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: NorthDriveDownloader-macOS-Universal-DMG
+          path: dist/*.dmg
+          if-no-files-found: error
