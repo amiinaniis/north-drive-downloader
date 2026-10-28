@@ -45,3 +45,12 @@ Working baseline: v0.1.2 DMG packaged on GitHub Actions. V1.0-development curren
 - [ ] **Publisher action:** create and verify Google OAuth Desktop application, then configure `NORTH_GOOGLE_CLIENT_ID` as a GitHub repository variable. Without this, sign-in is intentionally unavailable in the beta; the client ID is *not* a user-facing setting.
 - [ ] Test public-link resource keys and private client folders under the signed-in identity on a real Mac; Google restricted-scope verification still required for selling.
 - [ ] Account persistence, token expiry, and offline profile fallback QA.
+
+## Beta fix: 0.2.0 Google login and Drive access diagnosis
+- [x] Detect stale/expired Google Keychain session on startup; show **Continue with Google** instead of dead-ending as Connected.
+- [x] Check the Google Drive API immediately after OAuth; show explicit instructions when project API is disabled.
+- [x] Persistent error text in Accounts; manual Check Google connection action.
+- [x] Human-readable OAuth failure categories and simple regression tests.
+- [ ] Confirm Google Cloud OAuth client is **Desktop app** and the consent screen includes the tester's Gmail.
+- [ ] Verify the Google Drive API is enabled in the *same project* that owns the OAuth client ID.
+- [ ] Run a real Google sign-in + Drive folder download on macOS. CI proves only compile/packaging, not API availability or authorization.

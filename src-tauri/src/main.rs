@@ -226,15 +226,19 @@ async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<GoogleProfile
             if let Some(error) = params.get("error") { return Err(format!("Google authorization denied: {error}")); }
             return params.get("code").cloned().ok_or_else(|| "Missing authorization code".to_string());
         }
-    }).await.map_err(|_| "Google sign-in timed out".to_string())??;
+    }).await.map_err(|_| "Google sign-in did not complete. If Google showed Access blocked, check your OAuth Test users and Desktop client setup.".to_string())??;
     let response = state.client.post("https://oauth2.googleapis.com/token").form(&[
         ("code", code.as_str()), ("client_id", client_id), ("code_verifier", verifier.as_str()),
         ("redirect_uri", redirect_uri.as_str()), ("grant_type", "authorization_code")
     ]).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() { return Err(format!("Google sign-in failed: {}", response.text().await.unwrap_or_default())); }
+    if !response.status().is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(oauth_failure_text(&detail));
+    }
     let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
     let refresh = token.refresh_token.ok_or("Google did not return a refresh token; revoke access and retry")?;
     let profile = fetch_google_profile(&state.client, &token.access_token).await?;
+    ensure_google_drive_enabled(&state.client, &token.access_token).await?;
     keychain_entry()?.set_password(&refresh).map_err(|e| e.to_string())?;
     Ok(profile)
 }
@@ -246,9 +250,53 @@ async fn refresh_access_token(client: &Client, _prefs: &Preferences) -> Result<S
     let response = client.post("https://oauth2.googleapis.com/token").form(&[
         ("client_id", client_id), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
     ]).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() { return Err("Google session expired or was revoked. Reconnect your account".into()); }
+    if !response.status().is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        let code = serde_json::from_str::<serde_json::Value>(&detail).ok()
+            .and_then(|v| v.get("error").and_then(|s| s.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        return Err(format!("Google session is invalid ({code}). Reconnect your Google account."));
+    }
     let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
     Ok(token.access_token)
+}
+
+async fn ensure_google_drive_enabled(client: &Client, token: &str) -> Result<(), String> {
+    // A tiny live API probe: validates that the publisher's Google Cloud project
+    // has enabled Drive API and that Drive read scope was actually granted.
+    let response = client.get(DRIVE_BASE)
+        .bearer_auth(token)
+        .query(&[("pageSize", "1"), ("fields", "files(id)")])
+        .timeout(Duration::from_secs(20))
+        .send().await.map_err(|e| format!("Could not reach Google Drive API: {e}"))?;
+    if response.status().is_success() { return Ok(()); }
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    let text = body.to_lowercase();
+    if text.contains("has not been used") || text.contains("api is disabled")
+        || text.contains("accessnotconfigured") || text.contains("service_disabled") {
+        return Err("Google Drive API is disabled in the publisher's Google Cloud project. Enable it in APIs & Services, then try again.".into());
+    }
+    if status == 401 { return Err("Google Drive rejected the sign-in token. Disconnect and sign in again.".into()); }
+    if status == 403 && (text.contains("insufficient") || text.contains("scope")) {
+        return Err("Google Drive read permission was not granted. Sign in again and approve Drive access.".into());
+    }
+    let message = serde_json::from_str::<serde_json::Value>(&body).ok()
+        .and_then(|v| v.pointer("/error/message").and_then(|s| s.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| format!("HTTP {status}"));
+    Err(format!("Google Drive check failed: {}", message.chars().take(190).collect::<String>()))
+}
+
+fn oauth_failure_text(body: &str) -> String {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let code = value.as_ref().and_then(|v| v.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+    match code {
+        "invalid_client" => "Google rejected North Drive's OAuth client. Confirm the client ID is a Desktop app OAuth client in the correct Google Cloud project.".into(),
+        "unauthorized_client" | "redirect_uri_mismatch" => "Google rejected this desktop sign-in redirect. Check the Google OAuth client's type is Desktop app.".into(),
+        "access_denied" => "Google denied access. If the app is in Testing, add your Gmail under Google Auth Platform > Audience > Test users.".into(),
+        "invalid_grant" => "The Google sign-in code expired or was already used. Try connecting again.".into(),
+        _ => format!("Google OAuth failed ({code}). Check Google Cloud authentication settings.")
+    }
 }
 
 async fn fetch_google_profile(client: &Client, access_token: &str) -> Result<GoogleProfile, String> {
@@ -267,7 +315,9 @@ async fn fetch_google_profile(client: &Client, access_token: &str) -> Result<Goo
 async fn get_google_profile(state: State<'_, Arc<AppState>>) -> Result<GoogleProfile, String> {
     let prefs = state.prefs.lock().unwrap().clone();
     let token = refresh_access_token(&state.client, &prefs).await?;
-    fetch_google_profile(&state.client, &token).await
+    let profile = fetch_google_profile(&state.client, &token).await?;
+    ensure_google_drive_enabled(&state.client, &token).await?;
+    Ok(profile)
 }
 
 fn parse_drive_link(link: &str) -> Result<(String, Option<String>), String> {
@@ -648,6 +698,10 @@ mod tests {
     #[test] fn parse_folder_and_key() {
         let (id,k)=parse_drive_link("https://drive.google.com/drive/u/0/folders/1aBcD_efGh1234?resourcekey=0-secret").unwrap();
         assert_eq!(id,"1aBcD_efGh1234"); assert_eq!(k.as_deref(),Some("0-secret"));
+    }
+    #[test] fn oauth_error_classification() {
+        assert!(oauth_failure_text(r#"{"error":"invalid_client"}"#).contains("Desktop"));
+        assert!(oauth_failure_text(r#"{"error":"access_denied"}"#).contains("Test users"));
     }
     #[test] fn rejects_wrong_host() {assert!(parse_drive_link("https://evil.com/drive/folders/12345678").is_err());}
     #[test] fn rejects_path_traversal() { assert!(safe_relative("../footage.mov").is_err()); assert!(safe_relative("A/B.mov").is_ok()); }

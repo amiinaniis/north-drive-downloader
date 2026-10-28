@@ -77,6 +77,12 @@
       el.replaceChildren(img);
     }catch(e){/* fallback initials */}
   }
+  function showConnectionIssue(error) {
+    state.profileError=error?String(error):'';
+    const el=$('#connectionIssue');
+    el.hidden=!state.profileError;
+    el.textContent=state.profileError;
+  }
   function updateAccount(){
     const name=profileDisplayName();
     const signedIn=!!state.connected;
@@ -92,7 +98,9 @@
     $('#connectBtn').style.display=signedIn?'none':'';
     $('#disconnectBtn').style.display=signedIn?'':'none';
     $('#connectBtn').disabled=!state.managedOAuth;
-    $('#accountHelp').textContent=!state.managedOAuth?'Google sign-in has not been enabled for this build. Contact the app publisher.':signedIn?'This account can download any Google Drive folder you have permission to access. Your tokens are stored in macOS Keychain.':'Sign in with your existing Google account. We never ask for your Google password.';
+    $('#accountHelp').textContent=!state.managedOAuth?'Google sign-in has not been enabled for this build. Contact the app publisher.':signedIn?'Google sign-in has been verified against the Drive API. Your tokens are stored in macOS Keychain.':'Sign in with your existing Google account. We never ask for your Google password.';
+    $('#diagnoseBtn').style.display=signedIn?'inline-flex':'none';
+    showConnectionIssue(state.profileError);
     for(const [selector,fallback] of [['#sidebarAvatar','N'],['#topAccountBtn','N'],['#selectorAvatar','G'],['#accountsAvatar','G']])accountAvatar(selector,fallback);
   }
   async function savePrefs(){
@@ -109,8 +117,21 @@
       const profile=await invoke('connect_google');
       state.profile=profile;state.profileError='';state.connected=true;
       updateAccount();toast('Signed in as '+profileDisplayName());
-    }catch(e){toast(String(e),true)}
+    }catch(e){showConnectionIssue(e);goPage('accounts');toast('Google sign-in failed — see the error below',true)}
     finally{$('#connectBtn').textContent='Continue with Google';updateAccount();}
+  });
+  $('#diagnoseBtn').addEventListener('click',async()=>{
+    if(!tauri)return;
+    const btn=$('#diagnoseBtn');btn.disabled=true;btn.textContent='Checking Google…';
+    try{
+      state.profile=await invoke('get_google_profile');
+      state.connected=true;state.profileError='';
+      updateAccount();toast('Google account and Drive API are working');
+    }catch(e){
+      state.connected=false;state.profile=null;
+      showConnectionIssue(e);updateAccount();
+      toast('Google connection failed — reconnect your account',true);
+    }finally{btn.disabled=false;btn.textContent='Check Google connection';}
   });
   $('#disconnectBtn').addEventListener('click',async()=>{
     if(!tauri){toast('Preview mode only');return;}
@@ -162,8 +183,12 @@
     state.managedOAuth=!!auth.managedOAuthConfigured;
     state.connected=await invoke('is_connected');
     if(state.connected&&state.managedOAuth){
-      try{state.profile=await invoke('get_google_profile');}
-      catch(e){state.profileError=String(e);console.warn('Google profile could not be loaded',e);}
+      try{state.profile=await invoke('get_google_profile');state.profileError='';}
+      catch(e){
+        state.profileError='Saved Google session cannot access Drive: '+String(e)+'. Click Continue with Google to reconnect.';
+        state.connected=false;state.profile=null;
+        console.warn('Saved Google session invalid',e);
+      }
     }
     window.__TAURI__.event.listen('north:progress',event=>{const p=event.payload;if(!p?.id)return;state.progress[p.id]={bytes:p.bytes??0,status:p.status,speed:p.speed??0,message:p.message};queueRender()});window.__TAURI__.event.listen('north:summary',event=>{state.summary=event.payload;state.running=false;state.paused=false;render();if(state.summary.cancelled)toast('Transfer cancelled. Partial files kept.');else if(state.summary.failed)toast(`${state.summary.failed} file(s) failed. Inspect Issues for details.`,true);else toast(`Downloaded ${state.summary.completed} files successfully!`)});}catch(e){toast(`App initialization issue: ${e}`,true)}}else{$('#previewBanner').style.display='block';$('#linkInput').value='https://drive.google.com/drive/folders/DEMO-FOLDER';state.plan=demoPlan();for(const f of state.plan.files) state.progress[f.id]={bytes:0,status:'queued',speed:0};state.progress[state.plan.files[0].id]={bytes:Math.floor(state.plan.files[0].size*.42),status:'downloading',speed:22*1048576};state.progress[state.plan.files[2].id]={bytes:state.plan.files[2].size,status:'completed',speed:0};state.progress[state.plan.files[1].id]={bytes:Math.floor(state.plan.files[1].size*.14),status:'downloading',speed:8*1048576};state.running=true;$('#savePath').value='/Users/you/Downloads/Client Projects';}
     hydratePrefs();if(state.demo)$('#savePath').value='/Users/you/Downloads/Client Projects';updateAccount();render();setInterval(updateInsights,1500);}
