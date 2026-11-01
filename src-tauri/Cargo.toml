@@ -1,12 +1,12 @@
 [package]
 name = "north-drive-downloader"
-version = "0.1.2"
-description = "Direct Google Drive folder downloader for macOS"
+version = "0.2.0"
+description = "Direct Google Drive folder downloader for macOS and Windows"
 authors = ["North Drive"]
 edition = "2021"
 
 [build-dependencies]
-tauri-build = { version = "2" }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -19,8 +19,9 @@ base64 = "0.22"
 sha2 = "0.10"
 rand = "0.8"
 md5 = "0.7"
-keyring = { version = "3", features = ["apple-native"] }
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 
 [profile.release]
 strip = true

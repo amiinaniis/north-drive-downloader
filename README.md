@@ -1,4 +1,29 @@
-# North Drive Downloader 0.1.2 — DMG Builder Edition
+# North Drive Downloader 0.2.0 — macOS & Windows
+
+## What's new in 0.2.0
+
+- **Windows build.** NSIS setup `.exe`; refresh tokens stored in Windows Credential Manager; file names cleaned for NTFS (`<>:"|?*`, trailing dots, `CON`/`NUL`/`COM1`…).
+- **Multiple Google accounts.** Connect several accounts in **Accounts**, then pick one or leave **Automatic** (API key first, then each account until one can open the folder). Downloads use the account that scanned the folder.
+- **OAuth client secret** field in Settings. Google's Desktop OAuth clients require it during token exchange.
+- **Rate-limit handling.** Drive API calls retry 429/5xx/rate-limit 403s with exponential backoff and `Retry-After`; quota errors are reported clearly.
+
+## Windows
+
+### Build on GitHub (no local toolchain)
+
+Push this project including `.github/workflows/build-windows.yml`, open **Actions → Build Windows Installer → Run workflow**, then download the **NorthDriveDownloader-Windows-Setup** artifact.
+
+### Build locally
+
+Install Node.js 22+, Rust via `rustup` (default MSVC toolchain) and Visual Studio 2022 Build Tools with the **Desktop development with C++** workload. Then in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+```
+
+The installer is copied to `dist\`. It is **not code-signed**, so SmartScreen shows "Windows protected your PC" on first run (More info → Run anyway). A public release needs an Authenticode certificate.
+
+## macOS
 
 This is the **source project** for the dark/pink macOS Google Drive downloader. It is not a precompiled or validated installer. The included build pipeline targets a real **universal macOS `.dmg`** that opens with a `North Drive Downloader.app` icon and `Applications` folder shortcut.
 
@@ -6,7 +31,7 @@ This is the **source project** for the dark/pink macOS Google Drive downloader. 
 
 1. Create a GitHub repository, upload/commit the files in this project **including `.github/workflows/build-macos-dmg.yml`**. To retain this hidden folder, use Git, not a web upload that omits hidden directories.
 2. Open your repository's **Actions** tab → **Build macOS Universal DMG** → **Run workflow**.
-3. Once the workflow finishes successfully, download the **NorthDriveDownloader-macOS-Universal-DMG** artifact. Unzip that GitHub artifact to obtain `NorthDriveDownloader-0.1.2-universal-adhoc.dmg`.
+3. Once the workflow finishes successfully, download the **NorthDriveDownloader-macOS-Universal-DMG** artifact. Unzip that GitHub artifact to obtain `NorthDriveDownloader-0.2.0-universal-adhoc.dmg`.
 4. Open the DMG, drag **North Drive Downloader.app** onto **Applications**, then eject the DMG.
 
 The workflow runs on GitHub's macOS runner and **has not been run or verified yet**. If the application fails to compile, the workflow will fail rather than upload a fake installer.
@@ -43,4 +68,4 @@ The script verifies these entries and refuses to ship the image if they're missi
 
 ## Limitations
 
-Only one connected Google account, no persistent queue history, and downloads start after scanning finishes. Google Drive API quota/permissions, storage, and network limits still apply. Testing against non-sensitive Google Drive folders is recommended before using important client files.
+No persistent queue history, and downloads start after scanning finishes. Google Drive API quota/permissions, storage, and network limits still apply. Testing against non-sensitive Google Drive folders is recommended before using important client files.
