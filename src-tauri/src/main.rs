@@ -417,103 +417,247 @@ async fn wait_for_run(control: &RunControl) -> Result<(), String> {
         sleep(Duration::from_millis(200)).await;
     }
 }
+
+fn retryable_transfer_error(error: &str) -> bool {
+    // Do not waste minutes retrying permanent permissions, invalid requests, or unavailable files.
+    let permanent = ["HTTP 400", "HTTP 401", "HTTP 404", "HTTP 410", "HTTP 416"];
+    if permanent.iter().any(|code| error.contains(code)) { return false; }
+    if error.contains("HTTP 403") {
+        return ["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "Rate Limit", "rate limit"]
+            .iter().any(|reason| error.contains(reason));
+    }
+    if error.contains("MD5 checksum mismatch after clean retry")
+        || error.contains("Remote file changed during resume") { return false; }
+    true
+}
+
+fn validate_resume_response(
+    offset: u64, status: StatusCode, content_range: Option<&str>, expected_size: Option<u64>,
+) -> Result<bool, String> {
+    if offset == 0 {
+        if status != StatusCode::OK { return Err(format!("Unexpected download response HTTP {status}")); }
+        return Ok(false);
+    }
+    // A proxy may ignore Range. 200 means replace the partial; NEVER append a whole file to it.
+    if status == StatusCode::OK { return Ok(true); }
+    if status != StatusCode::PARTIAL_CONTENT {
+        return Err(format!("Cannot resume at byte {offset}: server returned HTTP {status}"));
+    }
+    let value = content_range.ok_or("Missing Content-Range on resumed download")?;
+    let (bounds, size) = value.strip_prefix("bytes ").and_then(|v| v.split_once('/'))
+        .ok_or("Invalid Content-Range on resumed download")?;
+    let (start, end) = bounds.split_once('-').ok_or("Invalid range boundaries")?;
+    let start = start.parse::<u64>().map_err(|_| "Invalid start of Content-Range")?;
+    let end = end.parse::<u64>().map_err(|_| "Invalid end of Content-Range")?;
+    if start != offset || end < start {
+        return Err(format!("Unexpected Content-Range {value}, requested byte {offset}"));
+    }
+    if size != "*" {
+        let remote_size = size.parse::<u64>().map_err(|_| "Invalid total in Content-Range")?;
+        if let Some(expected) = expected_size {
+            if remote_size != expected { return Err("Remote file changed during resume; rescan the folder".into()); }
+        }
+        if end >= remote_size { return Err("Content-Range exceeds remote file length".into()); }
+    }
+    Ok(false)
+}
+
+// Receipts allow idempotent retries for Workspace exports, which have no Drive MD5 or size.
+fn receipt_path(root: &Path, file: &DownloadItem) -> PathBuf {
+    let digest = Sha256::digest(file.relative_path.as_bytes());
+    root.join(".north-drive-state").join(format!("{digest:x}.json"))
+}
+async fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut f = async_fs::File::open(path).await.map_err(|e| e.to_string())?;
+    let mut sha = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let n = f.read(&mut buffer).await.map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        sha.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", sha.finalize()))
+}
+fn receipt_source(file: &DownloadItem) -> serde_json::Value {
+    serde_json::json!({"id":file.id,"size":file.size,"md5":file.md5_checksum,"mime":file.mime_type,"export":file.export_mime})
+}
+async fn previously_verified(root: &Path, file: &DownloadItem, target: &Path) -> Result<bool, String> {
+    if !target.is_file() { return Ok(false); }
+    let len = async_fs::metadata(target).await.map_err(|e| e.to_string())?.len();
+    if file.md5_checksum.as_ref().is_some_and(|sum| file.size == Some(len) && sum.len() == 32) {
+        return verify_md5(target, file.md5_checksum.as_ref().unwrap()).await;
+    }
+    if file.export_mime.is_some() {
+        let receipt = match async_fs::read(receipt_path(root, file)).await {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).ok(),
+            Err(_) => None,
+        };
+        if let Some(saved) = receipt {
+            if saved.get("source") == Some(&receipt_source(file))
+                && saved.get("length").and_then(|v| v.as_u64()) == Some(len)
+                && saved.get("sha256").and_then(|v| v.as_str()) == Some(sha256_file(target).await?.as_str()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+async fn record_export_completion(root: &Path, file: &DownloadItem, target: &Path, length: u64) -> Result<(), String> {
+    if file.export_mime.is_none() { return Ok(()); }
+    let path = receipt_path(root, file);
+    let dir = path.parent().ok_or("Invalid receipt directory")?;
+    async_fs::create_dir_all(dir).await.map_err(|e| e.to_string())?;
+    let payload = serde_json::json!({
+        "source": receipt_source(file), "length": length, "sha256": sha256_file(target).await?
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    let temp = path.with_extension("json.tmp");
+    async_fs::write(&temp, bytes).await.map_err(|e| e.to_string())?;
+    async_fs::rename(&temp, &path).await.map_err(|e| e.to_string())
+}
+
 async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, root: &Path, control: &RunControl) -> Result<(), String> {
     let relative = safe_relative(&file.relative_path)?;
     let target = root.join(relative);
     if let Some(parent) = target.parent() { async_fs::create_dir_all(parent).await.map_err(|e| e.to_string())?; }
-    // Skip only previously verified matching files. Never overwrite other files silently.
     if target.exists() {
-        if file.md5_checksum.as_ref().is_some_and(|sum| file.size == fs::metadata(&target).ok().map(|m| m.len()) && sum.len() == 32) {
-            if verify_md5(&target, file.md5_checksum.as_ref().unwrap()).await? {
-                progress(app, file, file.size.unwrap_or(0), "completed", 0.0, Some("Already verified".into()));
-                return Ok(());
-            }
+        if previously_verified(root, file, &target).await? {
+            progress(app, file, file.size.unwrap_or(fs::metadata(&target).map(|m| m.len()).unwrap_or(0)), "completed", 0.0, Some("Already verified".into()));
+            return Ok(());
         }
         return Err(format!("Existing destination file differs: {}. Move or rename it before downloading", target.display()));
     }
     let (part, meta) = part_paths(&target);
-    let fingerprint = serde_json::json!({"id":file.id,"size":file.size,"md5":file.md5_checksum,"mime":file.mime_type,"export":file.export_mime});
-    let expected = serde_json::to_vec(&fingerprint).map_err(|e| e.to_string())?;
+    let expected = serde_json::to_vec(&receipt_source(file)).map_err(|e| e.to_string())?;
     if part.exists() {
         if fs::read(&meta).ok().as_deref() != Some(expected.as_slice()) {
             return Err(format!("Partial file metadata does not match source: {}. Remove the .northpart files to restart", target.display()));
         }
     } else { async_fs::write(&meta, &expected).await.map_err(|e| e.to_string())?; }
-    let mut attempt = 0;
+    let mut attempt = 0u32;
+    let mut checksum_resets = 0u32;
     loop {
         wait_for_run(control).await?;
         attempt += 1;
-        let result = download_attempt(app, client, prefs, auth_cache, file, &part, control).await;
+        let mut result = download_attempt(app, client, prefs, auth_cache, file, &part, control).await;
+        if result.is_ok() {
+            match async_fs::metadata(&part).await {
+                Ok(m) => {
+                    let length = m.len();
+                    if file.size.is_some_and(|size| length != size) {
+                        result = Err(format!("Incomplete transfer: expected {} bytes, received {length}", file.size.unwrap_or(0)));
+                    } else if let Some(checksum) = &file.md5_checksum {
+                        progress(app, file, length, "verifying", 0.0, None);
+                        match verify_md5(&part, checksum).await {
+                            Ok(true) => {}
+                            Ok(false) if checksum_resets == 0 => {
+                                checksum_resets += 1;
+                                match async_fs::remove_file(&part).await {
+                                    Ok(()) => result = Err("MD5 checksum mismatch; retrying a fresh copy".into()),
+                                    Err(e) => result = Err(format!("Cannot reset corrupt partial: {e}")),
+                                }
+                            }
+                            Ok(false) => result = Err("MD5 checksum mismatch after clean retry; rescan the folder".into()),
+                            Err(e) => result = Err(format!("Cannot verify MD5: {e}")),
+                        }
+                    }
+                }
+                Err(e) => result = Err(format!("Cannot inspect partial file: {e}")),
+            }
+        }
         match result {
             Ok(()) => break,
             Err(e) => {
                 if control.cancelled.load(Ordering::SeqCst) { return Err("Cancelled".into()); }
-                if attempt >= 5 { return Err(format!("{} (after {attempt} attempts)", e)); }
-                progress(app, file, fs::metadata(&part).map(|m|m.len()).unwrap_or(0), "retrying", 0.0, Some(format!("Retry {attempt}/4: {e}")));
-                sleep(Duration::from_secs((1u64 << attempt).min(30))).await;
+                if attempt >= 8 || !retryable_transfer_error(&e) {
+                    return Err(format!("{e} (attempt {attempt}/8; partial download preserved)"));
+                }
+                let backoff = (1u64 << attempt.min(6)).min(45);
+                progress(app, file, fs::metadata(&part).map(|m| m.len()).unwrap_or(0),
+                    "retrying", 0.0, Some(format!("Retry {attempt}/7 in {backoff}s: {e}")));
+                // Poll cancellation while sleeping instead of trapping users in long backoffs.
+                for _ in 0..(backoff * 4) {
+                    wait_for_run(control).await?;
+                    sleep(Duration::from_millis(250)).await;
+                }
             }
         }
     }
     let length = fs::metadata(&part).map_err(|e| e.to_string())?.len();
-    if let Some(size) = file.size { if length != size { return Err(format!("Downloaded size mismatch: expected {size}, got {length}")); } }
-    if let Some(expected) = &file.md5_checksum {
-        progress(app, file, length, "verifying", 0.0, None);
-        if !verify_md5(&part, expected).await? { return Err("MD5 checksum mismatch. Partial file kept for inspection".into()); }
-    }
-    // Check for a conflicting destination again before finalizing.
     if target.exists() { return Err(format!("Destination appeared during transfer: {}", target.display())); }
-    // Same-directory rename is atomic on typical macOS volumes.
     async_fs::rename(&part, &target).await.map_err(|e| e.to_string())?;
     let _ = async_fs::remove_file(meta).await;
+    // A receipt failure must not mark an otherwise verified file as failed.
+    let _ = record_export_completion(root, file, &target, length).await;
     progress(app, file, length, "completed", 0.0, None);
     Ok(())
 }
+
 async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, path: &Path, control: &RunControl) -> Result<(), String> {
     let mut offset = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    // Google Workspace exports do not support byte ranges, so restart any partial export.
+    // Google Workspace exports do not support byte ranges; partial exports must restart.
     if file.export_mime.is_some() && offset > 0 {
         async_fs::remove_file(path).await.map_err(|e| e.to_string())?;
         offset = 0;
     }
+    if file.size.is_some_and(|size| offset > size) {
+        async_fs::remove_file(path).await.map_err(|e| e.to_string())?;
+        offset = 0;
+    }
     if file.size == Some(offset) && offset > 0 { return Ok(()); }
-    let endpoint = if let Some(mime) = &file.export_mime {
-        let _ = mime;
+    let endpoint = if file.export_mime.is_some() {
         format!("{DRIVE_BASE}/{}/export", file.id)
     } else { format!("{DRIVE_BASE}/{}", file.id) };
-    // Share a cached OAuth token across concurrent file transfers; refresh before expiry.
     let auth = current_access(auth_cache, client, prefs).await?;
     let mut req = auth.request(client, &endpoint);
-    if let Some(mime) = &file.export_mime { req = req.query(&[("mimeType",mime.as_str())]); }
-    else { req = req.query(&[("alt","media"), ("supportsAllDrives", "true")]); }
-    if let Some(key) = &file.resource_key { req = req.header("X-Goog-Drive-Resource-Keys",format!("{}/{}",file.id,key)); }
+    if let Some(mime) = &file.export_mime { req = req.query(&[("mimeType", mime.as_str())]); }
+    else { req = req.query(&[("alt", "media"), ("supportsAllDrives", "true")]); }
+    if let Some(key) = &file.resource_key { req = req.header("X-Goog-Drive-Resource-Keys", format!("{}/{}", file.id, key)); }
     if offset > 0 { req = req.header(header::RANGE, format!("bytes={offset}-")); }
-    let mut response = req.send().await.map_err(|e| e.to_string())?;
-    if response.status() == StatusCode::UNAUTHORIZED { expire_access(auth_cache).await; return Err("Google session expired; retrying with fresh token".into()); }
-    if offset > 0 {
-        if response.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(format!("Server did not honor resume range (HTTP {})", response.status()));
-        }
-        let range = response.headers().get(header::CONTENT_RANGE).and_then(|v|v.to_str().ok()).unwrap_or("");
-        if !range.starts_with(&format!("bytes {offset}-")) { return Err("Server returned unexpected content range".into()); }
-    } else if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("Google Drive HTTP {status}: {}",text.chars().take(180).collect::<String>()));
+    let mut response = req.send().await.map_err(|e| format!("Network error starting transfer: {e}"))?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        expire_access(auth_cache).await;
+        return Err("Google session expired; refreshing credentials".into());
     }
-    let mut f = async_fs::OpenOptions::new().create(true).append(true).open(path).await.map_err(|e| e.to_string())?;
-    let started = Instant::now(); let mut bytes = offset; let mut last_update = Instant::now();
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Google Drive HTTP {}: {}", status.as_u16(), body.chars().take(400).collect::<String>()));
+    }
+    let restart = validate_resume_response(
+        offset, response.status(), response.headers().get(header::CONTENT_RANGE).and_then(|h| h.to_str().ok()), file.size,
+    )?;
+    if restart {
+        // Server ignored Range (HTTP 200); truncate instead of corrupting by appending.
+        offset = 0;
+    }
+    let expected_response_len = response.content_length();
+    let mut f = async_fs::OpenOptions::new().create(true).write(true).append(!restart)
+        .truncate(restart).open(path).await.map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let mut bytes = offset;
+    let mut last_update = Instant::now();
     progress(app, file, bytes, "downloading", 0.0, None);
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(120), response.chunk()).await
+            .map_err(|_| "Network stalled for 120 seconds; resuming transfer".to_string())?
+            .map_err(|e| format!("Transfer interrupted: {e}"))?;
+        let Some(chunk) = chunk else { break; };
         wait_for_run(control).await?;
-        f.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        f.write_all(&chunk).await.map_err(|e| format!("Cannot write downloaded file (check disk space): {e}"))?;
         bytes += chunk.len() as u64;
         if last_update.elapsed() >= Duration::from_millis(280) {
-            let rate = (bytes-offset) as f64 / started.elapsed().as_secs_f64().max(0.001);
+            let rate = (bytes - offset) as f64 / started.elapsed().as_secs_f64().max(0.001);
             progress(app, file, bytes, "downloading", rate, None);
             last_update = Instant::now();
         }
     }
     f.flush().await.map_err(|e| e.to_string())?;
+    if let Some(expected) = expected_response_len {
+        if bytes - offset != expected {
+            return Err(format!("Incomplete HTTP response: expected {expected} bytes, received {}", bytes - offset));
+        }
+    }
     progress(app, file, bytes, "downloading", 0.0, None);
     Ok(())
 }
@@ -536,9 +680,11 @@ async fn start_download(app: AppHandle, state: State<'_, Arc<AppState>>, plan: F
     let state_handle = state.inner().clone();
     tauri::async_runtime::spawn(async move {
         let result = download_folder(&app_handle, &client, &prefs, &plan, &destination, &run).await;
+        {
+            let mut active = state_handle.run.lock().unwrap();
+            if active.as_ref().is_some_and(|existing| Arc::ptr_eq(existing, &run)) { *active = None; }
+        }
         let _ = app_handle.emit("north:summary", result);
-        let mut active = state_handle.run.lock().unwrap();
-        if active.as_ref().is_some_and(|existing| Arc::ptr_eq(existing, &run)) { *active = None; }
     });
     Ok(())
 }
@@ -601,7 +747,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let prefs = read_prefs(app.handle());
-            let client = Client::builder().connect_timeout(Duration::from_secs(25)).build()?;
+            let client = Client::builder().connect_timeout(Duration::from_secs(25)).pool_idle_timeout(Duration::from_secs(60)).build()?;
             app.manage(Arc::new(AppState { prefs: Mutex::new(prefs), run: Mutex::new(None), client }));
             Ok(())
         })
@@ -620,4 +766,20 @@ mod tests {
     #[test] fn rejects_wrong_host() {assert!(parse_drive_link("https://evil.com/drive/folders/12345678").is_err());}
     #[test] fn rejects_path_traversal() { assert!(safe_relative("../footage.mov").is_err()); assert!(safe_relative("A/B.mov").is_ok()); }
     #[test] fn collision_names() {let mut seen=HashSet::new();assert_eq!(unique_name("A.mov",&mut seen),"A.mov");assert_eq!(unique_name("a.MOV",&mut seen),"a (2).MOV");}
+
+    #[test] fn resumed_ranges_are_checked() {
+        assert_eq!(validate_resume_response(0, StatusCode::OK, None, Some(100)).unwrap(), false);
+        assert_eq!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 50-99/100"), Some(100)).unwrap(), false);
+        assert_eq!(validate_resume_response(50, StatusCode::OK, None, Some(100)).unwrap(), true);
+        assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 0-49/100"), Some(100)).is_err());
+        assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 50-99/200"), Some(100)).is_err());
+        assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, None, Some(100)).is_err());
+    }
+    #[test] fn retryable_errors_are_classified() {
+        assert!(retryable_transfer_error("Network stalled for 120 seconds"));
+        assert!(retryable_transfer_error("Google Drive HTTP 429: rateLimitExceeded"));
+        assert!(retryable_transfer_error("Google Drive HTTP 403: userRateLimitExceeded"));
+        assert!(!retryable_transfer_error("Google Drive HTTP 403: insufficientFilePermissions"));
+        assert!(!retryable_transfer_error("Google Drive HTTP 404: not found"));
+    }
 }
