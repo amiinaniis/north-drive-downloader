@@ -40,6 +40,7 @@ struct DownloadItem {
     md5_checksum: Option<String>,
     resource_key: Option<String>,
     export_mime: Option<String>,
+    modified_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +84,7 @@ struct DriveFile {
     size: Option<String>,
     md5_checksum: Option<String>,
     resource_key: Option<String>,
+    modified_time: Option<String>,
     capabilities: Option<Capabilities>,
 }
 #[derive(Debug, Deserialize)]
@@ -263,23 +265,46 @@ fn unique_name(name: &str, used: &mut HashSet<String>) -> String {
     format!("{}-duplicate", name)
 }
 
+
 async fn json_request<T: for<'de> Deserialize<'de>>(client: &Client, access: &Access, url: &str, params: &[(&str, String)], keys: &HashMap<String, String>) -> Result<T, String> {
-    let mut req = access.request(client, url).query(params);
-    if !keys.is_empty() {
-        let header_value = keys.iter().map(|(k,v)| format!("{k}/{v}")).collect::<Vec<_>>().join(",");
-        req = req.header("X-Goog-Drive-Resource-Keys", header_value);
+    let key_header = if keys.is_empty() { None } else {
+        Some(keys.iter().map(|(k,v)| format!("{k}/{v}")).collect::<Vec<_>>().join(","))
+    };
+    for attempt in 1..=6u32 {
+        let mut request = access.request(client, url).query(params);
+        if let Some(header_value) = &key_header {
+            request = request.header("X-Goog-Drive-Resource-Keys", header_value);
+        }
+        let result = request.send().await;
+        match result {
+            Ok(response) if response.status().is_success() => {
+                return response.json::<T>().await.map_err(|e| format!("Unexpected Google Drive response: {e}"));
+            }
+            Ok(response) => {
+                let status = response.status();
+                let retry_after = response.headers().get(header::RETRY_AFTER)
+                    .and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<u64>().ok());
+                let detail = response.text().await.unwrap_or_default();
+                let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                    || (status == StatusCode::FORBIDDEN && (detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded")));
+                if !retryable || attempt == 6 {
+                    return Err(format!("Google Drive HTTP {}: {}", status.as_u16(), detail.chars().take(300).collect::<String>()));
+                }
+                let delay = retry_after.unwrap_or((1u64 << attempt).min(30)).clamp(1, 60);
+                sleep(Duration::from_secs(delay)).await;
+            }
+            Err(e) => {
+                if attempt == 6 { return Err(format!("Google Drive network error after {attempt} attempts: {e}")); }
+                sleep(Duration::from_secs((1u64 << attempt).min(30))).await;
+            }
+        }
     }
-    let response = req.send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        let code = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        return Err(format!("Google Drive HTTP {}: {}", code.as_u16(), detail.chars().take(250).collect::<String>()));
-    }
-    response.json::<T>().await.map_err(|e| format!("Unexpected Google Drive response: {e}"))
+    Err("Drive request exhausted retries".into())
 }
+
 async fn metadata(client: &Client, access: &Access, id: &str, keys: &HashMap<String,String>) -> Result<DriveFile, String> {
     json_request(client, access, &format!("{DRIVE_BASE}/{id}"), &[
-        ("fields", "id,name,mimeType,size,md5Checksum,resourceKey,capabilities(canDownload)".into()),
+        ("fields", "id,name,mimeType,size,md5Checksum,resourceKey,modifiedTime,capabilities(canDownload)".into()),
         ("supportsAllDrives", "true".into())
     ], keys).await
 }
@@ -332,7 +357,7 @@ async fn scan_folder(link: String, state: State<'_, Arc<AppState>>) -> Result<Fo
             let mut params = vec![
                 ("q", format!("'{}' in parents and trashed = false", folder_id)),
                 ("pageSize", "1000".into()),
-                ("fields", "nextPageToken,files(id,name,mimeType,size,md5Checksum,resourceKey,capabilities(canDownload))".into()),
+                ("fields", "nextPageToken,files(id,name,mimeType,size,md5Checksum,resourceKey,modifiedTime,capabilities(canDownload))".into()),
                 ("supportsAllDrives", "true".into()),
                 ("includeItemsFromAllDrives", "true".into()),
             ];
@@ -368,7 +393,7 @@ async fn scan_folder(link: String, state: State<'_, Arc<AppState>>) -> Result<Fo
                 let file_path = relative_path;
                 let size = entry.size.and_then(|v| v.parse::<u64>().ok());
                 total_bytes = total_bytes.saturating_add(size.unwrap_or_default());
-                files.push(DownloadItem { id: entry.id, name: final_name, relative_path: file_path, size, mime_type: entry.mime_type, md5_checksum: entry.md5_checksum, resource_key: entry.resource_key, export_mime: export.map(|(m,_)| m.into()) });
+                files.push(DownloadItem { id: entry.id, name: final_name, relative_path: file_path, size, mime_type: entry.mime_type, md5_checksum: entry.md5_checksum, resource_key: entry.resource_key, export_mime: export.map(|(m,_)| m.into()), modified_time: entry.modified_time });
             }
             page = result.next_page_token;
             if page.is_none() { break; }
@@ -479,7 +504,11 @@ async fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", sha.finalize()))
 }
 fn receipt_source(file: &DownloadItem) -> serde_json::Value {
+    // Keep the partial-file fingerprint backward compatible with 0.1.2.
     serde_json::json!({"id":file.id,"size":file.size,"md5":file.md5_checksum,"mime":file.mime_type,"export":file.export_mime})
+}
+fn completed_source(file: &DownloadItem) -> serde_json::Value {
+    serde_json::json!({"source":receipt_source(file),"modifiedTime":file.modified_time})
 }
 async fn previously_verified(root: &Path, file: &DownloadItem, target: &Path) -> Result<bool, String> {
     if !target.is_file() { return Ok(false); }
@@ -493,10 +522,12 @@ async fn previously_verified(root: &Path, file: &DownloadItem, target: &Path) ->
             Err(_) => None,
         };
         if let Some(saved) = receipt {
-            if saved.get("source") == Some(&receipt_source(file))
-                && saved.get("length").and_then(|v| v.as_u64()) == Some(len)
-                && saved.get("sha256").and_then(|v| v.as_str()) == Some(sha256_file(target).await?.as_str()) {
-                return Ok(true);
+            if saved.get("source") == Some(&completed_source(file))
+                && saved.get("length").and_then(|v| v.as_u64()) == Some(len) {
+                let actual_hash = sha256_file(target).await?;
+                if saved.get("sha256").and_then(|v| v.as_str()) == Some(actual_hash.as_str()) {
+                    return Ok(true);
+                }
             }
         }
     }
@@ -508,7 +539,7 @@ async fn record_export_completion(root: &Path, file: &DownloadItem, target: &Pat
     let dir = path.parent().ok_or("Invalid receipt directory")?;
     async_fs::create_dir_all(dir).await.map_err(|e| e.to_string())?;
     let payload = serde_json::json!({
-        "source": receipt_source(file), "length": length, "sha256": sha256_file(target).await?
+        "source": completed_source(file), "length": length, "sha256": sha256_file(target).await?
     });
     let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
     let temp = path.with_extension("json.tmp");
