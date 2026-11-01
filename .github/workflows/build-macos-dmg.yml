@@ -19,9 +19,9 @@ jobs:
       APPLE_SIGNING_IDENTITY: '-'
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
       - name: Setup Rust universal targets
@@ -39,7 +39,7 @@ jobs:
       - name: Build and verify drag-and-drop DMG
         run: zsh scripts/build-dmg.command
       - name: Upload DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: NorthDriveDownloader-macOS-Universal-DMG
           path: dist/*.dmg
